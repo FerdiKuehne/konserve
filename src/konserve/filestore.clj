@@ -353,7 +353,7 @@
         (let [file-name   (uuid (first key-vec))
               data-folder (str folder "/data/")
               key-folder  (str folder "/meta/")]
-          (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key (first key-vec) :format :edn} config)
+          (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key (first key-vec) :format :edn :time (java.util.Date)} config)
           (write-edn serializer write-handlers read-handlers data-folder key-vec file-name up-fn args config))
         (catch Exception e
           e))))
@@ -388,7 +388,7 @@
     (let [file-name  (uuid key)
           key-folder (str folder "/meta/")]
       (async/thread
-        (do (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key key :format :binary} config)
+        (do (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key key :format :binary :time (java.util.Date.)} config)
             (write-binary folder (str file-name) key input config)))))
 
   PKeyIterable
@@ -399,6 +399,8 @@
         (fn [ks]
           (async/onto-chan ch (map :key ks))))
       ch)))
+
+
 
 (defmethod print-method FileSystemStore
   [store writer]
@@ -484,24 +486,21 @@
           store))
       (go store))))
 
-
-
-
 (comment
+
+;;but beautiful => cinema deutscher film
 
   (read-string "{:update-store {:version-12-to-14 true}}")
 
   (time (def store (<!! (new-fs-store "/tmp/konserve-fs-migration-test"))))
 
-  store
+   store
 
   (delete-store "/tmp/konserve-fs-migration-test")
-
 
   (.getParent (io/file "/tmp/konserve-fs-migration-test"))
 
   (clojure.string/replace-first "/tmp/abc"  "/" (System/getProperty "user.home"))
-
 
   (def xy "/tmp/abc")
 

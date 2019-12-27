@@ -4,5 +4,7 @@
             [konserve.serializers-test]))
 
 (run-tests 'konserve.filestore-test
-           'konserve.serializers-test)
+           ;'konserve.serializers-test
+           )
+
 

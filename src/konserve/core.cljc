@@ -4,11 +4,18 @@
                                         -update-in -dissoc -bget -bassoc
                                         -keys]]
             [hasch.core :refer [uuid]]
-            #?(:clj [clojure.core.async :refer [chan poll! put! <! go]]
-               :cljs [cljs.core.async :refer [chan poll! put! <!]]))
+            [clojure.test :refer [testing is]]
+            #?(:cljs [cljs.nodejs :as node])
+            #?(:clj [clojure.core.async :as async :refer [chan poll! put! <! go <!!]]
+               :cljs [cljs.core.async :as async :refer (take! <! >! put! take! close! chan poll!)]))
   #?(:cljs (:require-macros [cljs.core.async.macros :refer [go]]
+                            [cljs.test :refer [is testing]]
                             [konserve.core :refer [go-locked]])))
 
+
+#?(:cljs (defonce fs (node/require "fs")))
+
+#?(:cljs (defonce stream (node/require "stream")))
 
 (defn- cljs-env?
   "Take the &env from a macro, and tell whether we are expanding into cljs."
@@ -207,6 +214,67 @@
 (defn keys
   "Return a channel that will yield all top-level keys currently in the store."
   ([store] (-keys store)))
+
+(defn compliance-test
+  "Test the functionality of the Konserve Operations."
+  [init-store delete-store list-keys]
+  (testing "Core Konserve Functions"
+    (go
+       (let [folder "/tmp/konserve-test"
+             _      (delete-store folder)
+             store  (init-store folder)
+             binbar (atom nil)]
+         #_(<! (bassoc store :binbar #?(:clj (byte-array (range 10))
+                                      :cljs (js/Buffer.from (clj->js (range 10))))))
+         #_(<! (bget store :binbar
+                   #?(:clj (fn [{:keys [input-stream]}]
+                             (go
+                               (reset! binbar (map byte (slurp input-stream)))))
+                      :cljs (let [ch (chan)
+                                  rs (:read-stream %)]
+                              (.on rs "data" (fn [chunk]
+                                               (let [x chunk]
+                                                 (reset! binbar x))))
+                              (.on rs "close" (fn [_]
+                                                (put! ch true)
+                                                (close! ch)))
+                              (.on rs "error" (fn [err] (prn err)))
+                              ch))))
+         (<! (assoc store :foo :bar))
+         (is (= (<! (get store :foo))
+                :bar))
+         (is (= (<! (get-in store [:foo]))
+                :bar))
+         (<! (assoc-in store [:foo] {:bar :baz}))
+         (is (= (<! (get-in store [:foo :bar]))
+                :baz))
+         (<! (assoc store :baz :bar))
+         (<! (update store :baz name))
+         (is (= "bar"
+                (<! (get store :baz))))
+         (<! (assoc-in store [:baz] {:bar 42}))
+         (is (= (<! (get-in store [:baz :bar]))
+                42))
+         (<! (update-in store [:baz :bar] inc))
+         #?(:clj (is (= (<! (get-in store [:baz :bar]))
+                   43)))
+         (<! (update-in store [:baz :bar] + 2 3))
+         #?(:clj (is (= (<! (get-in store [:baz :bar]))
+                        48)))
+         #_(is (= (<!! (list-keys store))
+                  #{{:key :foo, :format :edn} {:key :binbar, :format :binary}}))
+         (<! (dissoc store :foo))
+         (is (= (<! (get-in store [:foo]))
+                nil))
+         #_(is (= (<!! (list-keys store))
+                  #{{:key :binbar, :format :binary}}))
+         #_(is #?(:clj (= @binbar (range 10))
+                :cljs (= (.toString @binbar) (.toString (js/Buffer.from (clj->js (range 10)))))))
+         #_(is (= [:binbar] (<!! (async/into [] (keys store)))))
+         (delete-store folder)
+         #_(let [store (init-store folder)]
+             (is (= (<!! (list-keys store))
+                    #{})))))))
 
 
 (comment

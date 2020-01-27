@@ -29,7 +29,8 @@
 
   PKeyIterable
   (-keys [_]
-    (async/to-chan (keys @state))))
+    (async/into #{}
+     (async/to-chan (keys @state)))))
 
 #?(:clj
    (defmethod print-method MemoryStore
@@ -54,10 +55,22 @@
            '[clojure.java.io :as io])
   (def store (<!! (new-mem-store)))
 
+  (type store)
+
+
   (go (def foo (<! (new-mem-store))))
 
 
   (<!! (-bassoc store "foo" (io/input-stream (byte-array 10 (byte 42)))))
-  (<!! (-bget store "foo" identity)))
+  (<!! (-bget store "foo" identity))
+
+
+  (map->MemoryStore {:state (atom {})
+                     :read-handlers (atom {})
+                     :write-handlers (atom {})
+                     :locks (atom {})})
+
+
+  )
 
 

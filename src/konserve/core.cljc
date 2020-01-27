@@ -5,7 +5,8 @@
                                         -keys]]
             [hasch.core :refer [uuid]]
             #?(:clj [clojure.core.async :refer [chan poll! put! <! go]]
-               :cljs [cljs.core.async :refer [chan poll! put! <!]]))
+               :cljs [cljs.core.async :refer [chan poll! put! <!]])
+            [clojure.core.async :as async])
   #?(:cljs (:require-macros [cljs.core.async.macros :refer [go]]
                             [konserve.core :refer [go-locked]])))
 
@@ -33,7 +34,7 @@
         (clojure.core/get (swap! locks (fn [old]
                                          (if (old key) old
                                              (clojure.core/assoc old key c))))
-             key))))
+                          key))))
 
 #?(:clj
    (defmacro go-locked [store key & code]
@@ -55,25 +56,26 @@
        res)))
 
 
+
+
 (defn exists?
   "Checks whether value is in the store."
   [store key]
   (go-locked
    store key
-   (<! (-exists? store key))))
+   (<! (-exists? store (uuid key)))))
 
 (defn get-in
   "Returns the value stored described by key-vec. Returns nil if the key-vec is
    not present, or the not-found value if supplied."
   ([store key-vec]
    (get-in store key-vec nil))
-  ([store key-vec not-found]
+  ([store [k & ks] not-found]
    (go-locked
-    store (first key-vec)
-    (let [a (<! (-get-in store [(first key-vec)]))]
-     (if (some? a)
-      (clojure.core/get-in a (rest key-vec))
-      not-found)))))
+    store k
+    (if-let [a (<! (-get-in store [k]))]
+      (clojure.core/get-in a ks)
+      not-found))))
 
 (defn get
   "Returns the value stored described by key. Returns nil if the key
@@ -83,14 +85,40 @@
   ([store key not-found]
    (get-in store [key] not-found)))
 
+
+(defn key->internal-key-space
+  "Converts key vector or scalar key into a format handled by all backends,
+  currently the primary key is mapped to an escaped UUID string for this purpose."
+  [key]
+  (if (or (vector? key) (seq? key))
+    (let [[k & ks] key]
+      (into [(str (uuid k))] ks))
+    (str (uuid key))))
+
+(defn key->meta-key-space
+  [key]
+  (if (or (vector? key) (seq? key))
+    (let [[k & ks] key]
+      (into [(str "meta_" (uuid k))] ks))
+    (str "meta_" (uuid key))))
+
+(defn create-meta-data [ks]
+  {:key (first ks)
+   :timestamp #?(:clj (java.util.Date.) :cljs (js/Date.))})
+
 (defn update-in
   "Updates a position described by key-vec by applying up-fn and storing
   the result atomically. Returns a vector [old new] of the previous
   value and the result of applying up-fn (the newly stored value)."
-  [store key-vec fn & args]
+  [store ks fn & args]
   (go-locked
-   store (first key-vec)
-   (<! (-update-in store key-vec fn args))))
+   store (first ks)
+   (let [meta-op (-assoc-in store [(key->meta-key-space (first ks))] (create-meta-data ks))
+         op (-update-in store (key->internal-key-space ks) fn args)]
+     (do
+       ;; TODO catch error of meta-op
+       (<! meta-op)
+       (<! op)))))
 
 (defn update
   "Updates a position described by key by applying up-fn and storing
@@ -100,12 +128,16 @@
   (apply update-in store [key] fn args))
 
 (defn assoc-in
-  "Associates the key-vec to the value, any missing collections for
-  the key-vec (nested maps and vectors) are newly created."
-  [store key-vec val]
+  "Associates the ks to the value, any missing collections for
+  the ks (nested maps and vectors) are newly created."
+  [store ks val]
   (go-locked
-   store (first key-vec)
-   (<! (-assoc-in store key-vec val))))
+   store (first ks)
+   (let [meta-op (-assoc-in store [(key->meta-key-space (first ks))] (create-meta-data ks))
+         op (-assoc-in store (key->internal-key-space ks) val)]
+     (do
+       (<! meta-op)
+       (<! op)))))
 
 (defn assoc
  "Associates the key-vec to the value, any missing collections for
@@ -206,7 +238,17 @@
 
 (defn keys
   "Return a channel that will yield all top-level keys currently in the store."
-  ([store] (-keys store)))
+  [store]
+  (-keys store))
+
+(defn meta-data-keys
+  "Return Meta Data of existing Keys."
+  [store]
+  (->> (-keys store)
+       (filter #(re-find #"meta" %))
+       (map (fn [fkey] (get-in store fkey)))
+       async/merge
+       (async/into #{})))
 
 
 (comment
@@ -216,6 +258,13 @@
                                                                map->Test})))))
 
 
+  (into [(uuid (first [1 2 3]))] (rest [1 2 3]))
+
+  (let [[key & args] [1 2 3]]
+    (into [key] args))
+
+
+  (filter #(re-find #"meta" %) #{"meta1" "meta2" "123"})
 
 
   ;; clj
@@ -223,7 +272,13 @@
            '[konserve.memory :refer [new-mem-store]]
            '[clojure.core.async :refer [<!! >!! chan] :as async])
 
+
+  (into (into nil [123]) [234])
+
   (def store (<!! (new-fs-store "/tmp/store")))
+
+  store
+
 
   (doseq [i (range 1000)]
     (<!! (update-in store [:foo] (fn [j] (if-not j i (+ j i))))))
@@ -232,7 +287,50 @@
 
   (delete-store "/tmp/store")
 
-  (def store (<!! (new-mem-store)))
+  (def store-new (<!! (new-mem-store)))
+
+
+
+store-new
+
+  (<!! (update-in store-new [:baz] (fn [old] (str old))))
+
+
+store
+
+(<!! (update-in store [:baz] (fn [old] (str old))))
+
+  (<!! (update-in store [:baz2] (fn [old] (str old))))
+
+  (->> (<!! (keys store-new)) (filter #(re-find #"meta" %)))
+
+
+  (<!! (keys store))
+
+  (= 
+   (:timestamp (<!! (get-in store-new [(str "meta_" (uuid :baz))])))
+
+   (:timestamp (<!! (get-in store [(str "meta_" (uuid :baz))]))))
+
+store
+
+store-new
+
+
+  (def old (<!! (get-in store-new (str "meta_" :baz))))
+
+  (def new (<!! (get-in store-new (str "meta_" :baz))))
+
+
+
+  (doseq [i (range 10)]
+    (<!! (assoc-in store [i] i)))
+
+  (<!! (get-in store "keys"))
+
+
+  [old new]
+
 
   (<!! (list-keys store))
 
@@ -269,6 +367,11 @@
   (<!! (log store :bar))
 
   (<!! (assoc-in store [{:nanofoo :bar}] :foo))
+
+  (<!! (get-in store [{:nanofoo :bar}]))
+
+  (<!! (get-in store (str "meta_" {:nanofoo :bar})))
+
 
   ;; investigate https://github.com/stuartsierra/parallel-async
   (let [res (chan (async/sliding-buffer 1))
@@ -341,12 +444,12 @@
   (<!! (-assoc-in store [42] (Test. 5)))
   (<!! (-get-in store [42]))
 
-
+  (str "meta_" (uuid "123"))
 
   (assoc-in nil [] {:bar "baz"})
 
 
-
+  (str "meta_" (take 10 (only-alphanumeric-chars :baz)) (uuid :baz))
 
 
   (defrecord Test [t])

@@ -353,7 +353,7 @@
         (let [file-name   (uuid (first key-vec))
               data-folder (str folder "/data/")
               key-folder  (str folder "/meta/")]
-          (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key (first key-vec) :format :edn :time (java.util.Date)} config)
+          (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key (first key-vec) :format :edn} config)
           (write-edn serializer write-handlers read-handlers data-folder key-vec file-name up-fn args config))
         (catch Exception e
           e))))
@@ -388,7 +388,7 @@
     (let [file-name  (uuid key)
           key-folder (str folder "/meta/")]
       (async/thread
-        (do (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key key :format :binary :time (java.util.Date.)} config)
+        (do (write-edn-key serializer write-handlers read-handlers key-folder file-name {:key key :format :binary} config)
             (write-binary folder (str file-name) key input config)))))
 
   PKeyIterable
@@ -493,6 +493,12 @@
   (read-string "{:update-store {:version-12-to-14 true}}")
 
   (time (def store (<!! (new-fs-store "/tmp/konserve-fs-migration-test"))))
+
+
+  (<!! (-assoc-in store [":123"] 43))
+
+  (<!! (-get-in store [:foo]))
+
 
    store
 

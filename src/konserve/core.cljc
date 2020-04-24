@@ -134,8 +134,8 @@
 (defn assoc
  "Associates the key-vec to the value, any missing collections for
  the key-vec (nested maps and vectors) are newly created."
- [store key meta-up-fn val]
- (assoc-in store [key] meta-up-fn val))
+ [store key val]
+ (assoc-in store [key] val))
 
 (defn dissoc
   "Removes an entry from the store. "

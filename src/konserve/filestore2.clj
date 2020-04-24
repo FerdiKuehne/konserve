@@ -7,25 +7,29 @@
    [incognito.fressian :refer [incognito-read-handlers
                                incognito-write-handlers]]
    [konserve.protocols :refer [PEDNAsyncKeyValueStore
-                               -exists? -get -get-meta -update-in -dissoc -assoc-in
+                               -get -get-meta -update-in -dissoc -assoc-in
                                PBinaryAsyncKeyValueStore -bget -bassoc
                                -serialize -deserialize
-                               PKeyIterable]]
+                               PKeyIterable
+                               -keys]]
    [konserve.utils :refer [go-try <? throw-if-exception]]
    [clojure.core.async :as async
     :refer [<!! <! >! timeout chan alt! go go-loop close! put!]])
   (:import
    [java.io
+    Reader
     File
     InputStream
     StringReader
-    CharArrayReader 
+    CharArrayReader
     DataInputStream DataOutputStream
     BufferedInputStream
     FileInputStream FileOutputStream
     ByteArrayOutputStream ByteArrayInputStream]
    [java.nio.channels Channels FileChannel AsynchronousFileChannel CompletionHandler ReadableByteChannel]
-   [java.nio ByteBuffer]
+   [java.nio
+    ByteBuffer
+    CharBuffer]
    [java.nio.file Files StandardCopyOption FileSystems Path Paths OpenOption LinkOption
     StandardOpenOption FileVisitOption]))
 
@@ -38,7 +42,7 @@
 (defn delete-store
   "Permanently deletes the folder of the store with all files."
   [folder]
-  (let [f (io/file folder)
+  (let [f             (io/file folder)
         parent-folder (.getParent f)]
     (doseq [c (.list (io/file folder))]
       (.delete (io/file (str folder "/" c))))
@@ -62,37 +66,58 @@
 (defmulti
   ^{:doc "Internal helper for write-binary"
     :private true
-    :arglists '([input])}
+    :arglists '([input buffer-size])}
   blob->channel
-  (fn [input] [(type input)]))
+  (fn [input buffer-size] [(type input)]))
 
+(defmethod blob->channel [InputStream] [^InputStream input buffer-size]
+  [(.getChannel input)
+   (ByteBuffer/allocate buffer-size)
+   (fn [bis buffer] (.read bis buffer))])
 
-                                        ;check reader for nio (channels)
-                                        ;add URL for resource java.net.url
-                                        ;java.io.reader => beispeiel
-;(StringReader. "foo")
+(defmethod blob->channel [byte-array-type] [^"[B" input buffer-size]
+  [(Channels/newChannel (ByteArrayInputStream. input))
+   (ByteBuffer/allocate buffer-size)
+   (fn [bis buffer] (.read bis buffer))])
 
-(defmethod blob->channel [InputStream] [^InputStream input]
-  (.getChannel input))
+(defmethod blob->channel [File] [^File input buffer-size]
+  [(Channels/newChannel (FileInputStream. input))
+   (ByteBuffer/allocate buffer-size)
+   (fn [bis buffer] (.read bis buffer))])
 
-(defmethod blob->channel [byte-array-type] [^"[B" input]
-  (Channels/newChannel (ByteArrayInputStream. input)))
+(defmethod blob->channel [String] [^String input buffer-size]
+  [(Channels/newChannel (ByteArrayInputStream. (.getBytes input)))
+   (ByteBuffer/allocate buffer-size)
+   (fn [bis buffer] (.read bis buffer))])
 
-(defmethod blob->channel [File] [^File input]
-  (Channels/newChannel (FileInputStream. input)))
+(defmethod blob->channel [char-array-type] [input buffer-size]
+  [(Channels/newChannel (ByteArrayInputStream. char-array-type))
+   (ByteBuffer/allocate buffer-size)
+   (fn [bis buffer] (.read bis buffer))])
+;remove bytebuffer ;move char-array to vector;url to reader;cut array; typ readerffno;update resource 
+(defmethod blob->channel [Reader] [^Reader input buffer-size]
+  [input
+     (ByteBuffer/allocate buffer-size)
+     (fn [bis nio-buffer]
+       (let [char-array (make-array Character/TYPE buffer-size)
+             size (.read bis char-array)]
+           (try
+             (when-not (= size -1)
+               (let [char-array (java.util.Arrays/copyOf char-array size)]
+                 (.put nio-buffer (.getBytes (String. char-array)))))
+             size
+             (catch Exception e
+              (throw e)))))])
 
-(defmethod blob->channel [String] [^String input]
-  (Channels/newChannel (ByteArrayInputStream. (.getBytes input))))
+                                        ;config sync / async
+;(<!! (-bassoc store :binaryfoo (fn [old] {:format :binary :key :binaryfoo}) (StringReader. "foo")))
 
-(defmethod blob->channel [char-array-type] [input]
-  (Channels/newChannel (ByteArrayInputStream. char-array-type)))
-
-(defmethod blob->channel [Reader] [^Reader input]
-                                        ;get reader
-  )
-
-
-;Type? same as io/copy 
+#_(<!! (-bget store :binaryfoo (fn [{:keys [input-stream]}]
+                               (go
+                                 (do
+                                   (prn (slurp input-stream)) 
+                                   true)))))
+;refactor blob channel examples
 (defn- completion-write-handler [ch msg]
   (proxy [CompletionHandler] []
     (completed [res att]
@@ -102,31 +127,25 @@
                         (assoc msg :exception t)))
       (close! ch))))
 
-(def buffer-size (* 1024 1024))
-                                        ;profile binary => timing ?,  resize the buffer *1000
-                                        ;add error routine
-                                        ;go-loop check error handling
-;check binary for rewrite
-(defn- write-binary [input-stream ac key start]
-  (let [bis    (blob->channel input-stream)
-        stop   (+ buffer-size start)
-        buffer (ByteBuffer/allocate buffer-size)]
-    (go
-      (try
+(defn- write-binary [input-stream ac buffer-size key start]
+  (let [[bis buffer read]    (blob->channel input-stream buffer-size)
+        stop   (+ buffer-size start)]
+    (go-try
         (loop [start-byte start
                stop-byte  stop]
-          (let [size   (.read bis buffer)
+          (let [size   (read bis buffer)
                 _      (.flip buffer)
                 res-ch (chan)]
-            (when-not (= size -1)
-              (.write ac buffer start-byte stop-byte (completion-write-handler res-ch {:type :write-binary-error
-                                                                                       :key  key}))
-              (<? res-ch)
-              (.clear buffer)
-              (recur (+ buffer-size start-byte) (+ buffer-size stop-byte)))))
+            (if (= size -1)
+              (close! res-ch)
+              (do (.write ac buffer start-byte stop-byte (completion-write-handler res-ch {:type :write-binary-error
+                                                                                           :key  key}))
+                  (<? res-ch)
+                  (.clear buffer)
+                  (recur (+ buffer-size start-byte) (+ buffer-size stop-byte))))))
         (finally
           (.close bis)
-          (.clear buffer))))))
+          (.clear buffer)))))
 
 (defn- write-edn [ac-new key serializer write-handlers start-byte value byte-array]
   (let [bos       (ByteArrayOutputStream.)
@@ -135,21 +154,16 @@
         stop-byte (.size bos)
         buffer    (ByteBuffer/wrap (.toByteArray bos))
         result-ch (chan)]
-    (go
-      (try
+    (go-try
         (.write ac-new buffer start-byte stop-byte (completion-write-handler result-ch {:type :write-edn-error
                                                                                         :key  key}))
         (<? result-ch)
         (finally
           (close! result-ch)
           (.clear buffer)
-          (.close bos))))))
+          (.close bos)))))
 
-#_(ex-info "Could not write key file."
-       (assoc msg :exception e))
-
-;Go Try
-(defn- update-file [path serializer write-handlers [key & rkey] {:keys [file-name up-fn up-fn-args up-fn-meta type config operation input msg]} [old-meta old-value]]
+(defn- update-file [folder config path serializer write-handlers buffer-size [key & rkey] {:keys [file-name up-fn up-fn-args up-fn-meta type config operation input msg]} [old-meta old-value]]
   (try
     (let [path-new             (Paths/get (str file-name ".new") (into-array String []))
           standard-open-option (into-array StandardOpenOption
@@ -167,18 +181,19 @@
           _                    (.close bos)
           start-byte           (+ Long/BYTES meta-size)
           byte-array           (byte-array Long/BYTES (list meta-size))]
-      (go
-        (try
+      (go-try
           (<? (write-edn ac-new key serializer write-handlers 0 meta byte-array))
           (<? (if (= operation :write-binary)
-                (write-binary input ac-new key start-byte)
+                (write-binary input ac-new buffer-size key start-byte)
                 (write-edn ac-new key serializer write-handlers start-byte value nil)))
-          (.close ac-new)
+          (.close ac-new) ;add config fileesync
           (Files/move path-new path
                       (into-array [StandardCopyOption/ATOMIC_MOVE]))
+          (when (:fsync config)
+            (sync-folder folder))
           (if (= operation :write-edn) [old-value value] true)
           (finally
-            (.close ac-new)))))))
+            (.close ac-new))))))
 
 (defn completion-read-handler [res-ch bb meta-size file-size {:keys [msg operation locked-cb file-name]} fn-read]
   (proxy [CompletionHandler] []
@@ -186,15 +201,13 @@
       (try
         (case operation
           (:read-edn :read-meta) (let [bais-read (ByteArrayInputStream. (.array bb))
-                                                     value     (fn-read bais-read)
-                                                     _         (.close bais-read)]
-                                                 (put! res-ch value)
-                                                 )
-          :write-binary (let [bais-read (ByteArrayInputStream. (.array bb))
-                              value     (fn-read bais-read)
-                              _         (.close bais-read)]
-                          (put! res-ch [value nil])
-                          )
+                                       value     (fn-read bais-read)
+                                       _         (.close bais-read)]
+                                   (put! res-ch value))
+          :write-binary          (let [bais-read (ByteArrayInputStream. (.array bb))
+                                       value     (fn-read bais-read)
+                                       _         (.close bais-read)]
+                                   (put! res-ch [value nil]))
           :write-edn             (let [bais-meta  (ByteArrayInputStream. (.array bb) 0 meta-size)
                                        meta       (fn-read bais-meta)
                                        _          (.close bais-meta)
@@ -212,8 +225,6 @@
       (put! res-ch (ex-info "Could not read key."
                             (assoc msg :exception t))))))
 
-;use <? go-try
-;go-try
 (defn- read-file [ac serializer read-handlers {:keys [operation] :as env} meta-size]
   (let [file-size                         (.size ac)
         {:keys [bb start-byte stop-byte]} (cond
@@ -227,19 +238,14 @@
                                                                                                         :start-byte (+ meta-size Long/BYTES)
                                                                                                         :stop-byte  file-size})
         res-ch (chan)]
-    (go (try
-          (.read ac bb start-byte stop-byte
-                 (completion-read-handler res-ch bb meta-size file-size env
-                                          (partial -deserialize serializer read-handlers)))
-            (let [value (<? res-ch)]
-              value)
-            (finally
-              (.clear bb))))))
+    (go-try
+      (.read ac bb start-byte stop-byte
+          (completion-read-handler res-ch bb meta-size file-size env
+                                   (partial -deserialize serializer read-handlers)))
+      (<? res-ch)
+      (finally
+        (.clear bb)))))
 
-
-;go try finally => finally = release resourc
-;cps lisp 
-;add result channel
 (defn completion-read-meta-size-handler [res-ch bb msg]
   (proxy [CompletionHandler] []
     (completed [res att]
@@ -257,8 +263,33 @@
       (put! res-ch (ex-info "Could not read key."
                             (assoc msg :exception t))))))
 
-                                        ;go-try in nested funktions
-(defn- io-operation [key-vec folder serializer read-handlers write-handlers {:keys [operation msg] :as env}]
+(defn list-keys [folder serializer read-handlers]
+  (let [path       (Paths/get folder (into-array String []))
+        file-paths (Files/newDirectoryStream path)]
+    (->> (map
+          #(when (Files/exists % (into-array LinkOption []))
+             (let [ac        (AsynchronousFileChannel/open % (into-array StandardOpenOption [StandardOpenOption/READ]))
+                   bb        (ByteBuffer/allocate Long/BYTES)
+                   path-name (.toString %)
+                   env       {:operation :read-meta
+                              :msg       {:type :read-meta-error
+                                          :path path-name}}
+                   res-ch    (chan)]
+               (go-try
+                   (.read ac bb 0 Long/BYTES
+                          (completion-read-meta-size-handler res-ch bb
+                                                             {:type :read-list-keys
+                                                              :path path-name}))
+                 (<? (read-file ac serializer read-handlers env (<? res-ch)))
+                 (finally
+                   (.clear bb)
+                   (.close ac)
+                   (close! res-ch)))))
+          file-paths)
+         async/merge
+         (async/into #{}))))
+
+(defn- io-operation [key-vec folder config serializer read-handlers write-handlers buffer-size {:keys [operation msg] :as env}]
   (let [key          (first  key-vec)
         fn           (str folder "/" (uuid key))
         env          (assoc env :file-name fn)
@@ -281,22 +312,16 @@
                (let [meta-size (<? res-ch)
                      old       (<? (read-file ac serializer read-handlers env meta-size))]
                  (if (or (= :write-edn operation) (= :write-binary operation))
-                   (<? (update-file path serializer write-handlers key-vec env old))
+                   (<? (update-file folder config path serializer write-handlers buffer-size key-vec env old))
                    old))
                (finally
                  (close! res-ch)
                  (.clear bb)
                  (.close ac))))
-          (go
-            (try
-              (<? (update-file path serializer write-handlers key-vec env [nil nil]))
+          (go-try
+              (<? (update-file folder config path serializer write-handlers buffer-size key-vec env [nil nil]))
               (finally
-                (.close ac))))
-          #_(go-try
-                (<? (update-file path serializer write-handlers key-vec env [nil nil]))
-            (finally
-              (close! res-ch)
-              (.close ac)))))
+                (.close ac)))))
       (go nil))))
 
 (defn- delete-file [key folder]
@@ -311,45 +336,45 @@
       (close! res-ch))
     res-ch))
 
-;add keys
-(defrecord FileSystemStore [folder serializer read-handlers write-handlers locks config]
+(defrecord FileSystemStore [folder serializer read-handlers write-handlers buffer-size locks config]
   PEDNAsyncKeyValueStore
   (-get [this key]
-    (io-operation [key] folder serializer read-handlers write-handlers {:operation :read-edn
-                                                                        :format    :data
-                                                                        :msg       {:type :read-edn-error
-                                                                                    :key  key}}))
+    (io-operation [key] folder config serializer read-handlers write-handlers buffer-size {:operation :read-edn
+                                                                                    :format    :data
+                                                                                    :msg       {:type :read-edn-error
+                                                                                                :key  key}}))
   (-get-meta [this key]
-    (io-operation [key] folder serializer read-handlers write-handlers {:operation :read-meta
-                                                                        :format    :meta
-                                                                        :msg       {:type :read-meta-error
-                                                                                    :key  key}}))
+    (io-operation [key] folder config serializer read-handlers write-handlers buffer-size {:operation :read-meta
+                                                                                    :msg       {:type :read-meta-error
+                                                                                                :key  key}}))
   (-update-in [this key-vec meta-up up-fn] (-update-in this key-vec meta-up up-fn []))
   (-update-in [this key-vec meta-up up-fn args]
-    (io-operation key-vec folder serializer read-handlers write-handlers {:operation  :write-edn
-                                                                          :up-fn      up-fn
-                                                                          :up-fn-args args
-                                                                          :format     :data
-                                                                          :up-fn-meta meta-up
-                                                                          :config     config
-                                                                          :msg        {:type :write-edn-error
-                                                                                       :key  (first key-vec)}}))
+    (io-operation key-vec folder config serializer read-handlers write-handlers buffer-size {:operation  :write-edn
+                                                                                      :up-fn      up-fn
+                                                                                      :up-fn-args args
+                                                                                      :up-fn-meta meta-up
+                                                                                      :config     config
+                                                                                      :msg        {:type :write-edn-error
+                                                                                                   :key  (first key-vec)}}))
   (-dissoc [this key]
     (delete-file key folder))
   PBinaryAsyncKeyValueStore
   (-bget [this key locked-cb]
-    (io-operation [key] folder serializer read-handlers write-handlers {:operation :read-binary
-                                                                        :config    config
-                                                                        :locked-cb locked-cb
-                                                                        :msg       {:type :read-binary-error
-                                                                                    :key  key}}))
+    (io-operation [key] folder config serializer read-handlers write-handlers buffer-size {:operation :read-binary
+                                                                                    :config    config
+                                                                                    :locked-cb locked-cb
+                                                                                    :msg       {:type :read-binary-error
+                                                                                                :key  key}}))
   (-bassoc [this key meta-up input]
-    (io-operation [key] folder serializer read-handlers write-handlers {:operation  :write-binary
-                                                                        :input      input
-                                                                        :up-fn-meta meta-up
-                                                                        :config     config
-                                                                        :msg        {:type :write-binary-error
-                                                                                     :key  key}})))
+    (io-operation [key] folder config serializer read-handlers write-handlers buffer-size {:operation  :write-binary
+                                                                                    :input      input
+                                                                                    :up-fn-meta meta-up
+                                                                                    :config     config
+                                                                                    :msg        {:type :write-binary-error
+                                                                                                 :key  key}}))
+  PKeyIterable
+  (-keys [this]
+    (list-keys folder serializer read-handlers)))
 
 (defn- check-and-create-folder [path]
     (let [f         (io/file path)
@@ -361,53 +386,33 @@
                                                  :folder path})))
     (.delete test-file)))
 
-                                        ;add config file
-
 (defn new-fs-store
   "Filestore contains a Key and a Data Folder"
-  [path  & {:keys [serializer read-handlers write-handlers config]
+  [path  & {:keys [serializer read-handlers write-handlers buffer-size config]
             :or   {serializer     (ser/fressian-serializer)
                    read-handlers  (atom {})
                    write-handlers (atom {})
+                   buffer-size    (* 1024 1024)
                    config         {:fsync true}}}]
   (let [_     (check-and-create-folder path)
         store (map->FileSystemStore {:folder         path
                                      :serializer     serializer
                                      :read-handlers  read-handlers
                                      :write-handlers write-handlers
+                                     :buffer-size buffer-size    
                                      :locks          (atom {})
                                      :config         config})]
     (go store)))
 
-                                        ;rename into keys
-                                        ;locked read?
-                                        ;*.new
-                                        ;sleep phase => garbage collector => in config
-
-(defn list-keys [{:keys [folder serializer read-handlers]}]
-  (let [path       (Paths/get "/tmp/konserve" (into-array String []))
-        file-paths (Files/newDirectoryStream path)]
-    (go-try
-      (->> (map (go path) paths)
-           async/merge
-           (asnyc/into {}))
-      (finally
-        ))
-    ))
-
 (comment
-
-;add buffer size for binary write in konserve configs 
-
   (do
     (delete-store "/tmp/konserve")
     (def store (<!! (new-fs-store "/tmp/konserve")))
     (<!! (-update-in store ["fooNew2"] (fn [old] {:format :edn :key "bar2"}) (fn [old] 0))))
 
+  (<!! (-update-in store ["fooNew3"] (fn [old] {:format :edn :key "bar4"}) (fn [old] 0)))
 
-(<!! (keys ))
-
-(list-keys store)
+  (<!! (-keys store))
 
   (<!! (-update-in store ["fooNew2"] (fn [old] {:format :edn :key "bar2"}) inc))
 
@@ -436,8 +441,18 @@
 
   (<!! (-bassoc store :binaryfoo (fn [old] {:format :binary :key :binaryfoo}) (byte-array (range 10))))
 
+
+  (<!! (-bassoc store :binaryfoo (fn [old] {:format :binary :key :binaryfoo}) (StringReader. "foo213")))
+
+  (<!! (-bget store :binaryfoo (fn [{:keys [input-stream]}]
+                                 (go
+                                   (do
+                                     (prn (slurp input-stream)) 
+                                     true)))))
+
   (<!! (-get-meta store :binaryfoo))
 
-  )
 
+  
+)
 

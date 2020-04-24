@@ -2,12 +2,28 @@
   (:require [konserve.protocols :refer [PStoreSerializer -serialize -deserialize]]
             #?@(:clj [[clojure.data.fressian :as fress]
                       [incognito.fressian :refer [incognito-read-handlers
-                                                  incognito-write-handlers]]])
+                                                  incognito-write-handlers]]
+                      [taoensso.nippy :as nippy]])
             #?@(:cljs [[fress.api :as fress]
                        [incognito.fressian :refer [incognito-read-handlers incognito-write-handlers]]])
             [incognito.edn :refer [read-string-safe]])
   #?(:clj (:import [java.io FileOutputStream FileInputStream DataInputStream DataOutputStream]
-                   [org.fressian.handlers WriteHandler ReadHandler])))
+                   [org.fressian Reader]
+                   [org.fressian.handlers WriteHandler ReadHandler]))
+  (:import
+   [java.io ByteArrayInputStream ByteArrayOutputStream DataInputStream
+    DataOutputStream Serializable ObjectOutputStream ObjectInputStream
+    DataOutput DataInput]
+   [java.lang.reflect Method]
+   ;; [java.net URI] ; TODO
+   [java.util Date UUID]
+   [java.util.regex Pattern]
+   [clojure.lang Keyword Symbol BigInt Ratio
+    APersistentMap APersistentVector APersistentSet
+    IPersistentMap ; IPersistentVector IPersistentSet IPersistentList
+    PersistentQueue PersistentTreeMap PersistentTreeSet PersistentList
+    LazySeq IRecord ISeq]))
+
 
 #?(:clj
    (defrecord FressianSerializer [custom-read-handlers custom-write-handlers]
@@ -50,6 +66,7 @@
   ([] (fressian-serializer {} {}))
   ([read-handlers write-handlers] (map->FressianSerializer {:custom-read-handlers read-handlers
                                                             :custom-write-handlers write-handlers})))
+
 (defrecord StringSerializer []
   PStoreSerializer
   (-deserialize [_ read-handlers s]
@@ -63,6 +80,18 @@
 
 (defn string-serializer []
   (map->StringSerializer {}))
+
+(defrecord NippySerializer []
+  PStoreSerializer
+  (-deserialize [_ _ bytes]
+    (do
+      
+      (nippy/thaw-from-in! bytes)))
+  (-serialize [_ bytes _ val]
+    (nippy/freeze-to-out! bytes val)))
+
+(defn nippy-serializer []
+  (map->NippySerializer {}))
 
 
 
